@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic_notification_payload: str = "notification-payload"
     kafka_consumer_group: str = "finvarta-whatsapp-notification-consumer"
+    kafka_auto_offset_reset: str = "earliest"  # "earliest" to read backlog when no offset; "latest" for only new
 
     @model_validator(mode="before")
     @classmethod
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
             ("KAFKA_BOOTSTRAP_SERVERS", "kafka_bootstrap_servers"),
             ("KAFKA_TOPIC_NOTIFICATION_PAYLOAD", "kafka_topic_notification_payload"),
             ("KAFKA_CONSUMER_GROUP", "kafka_consumer_group"),
+            ("KAFKA_AUTO_OFFSET_RESET", "kafka_auto_offset_reset"),
         ]:
             if env_key in os.environ:
                 data[attr] = os.environ[env_key]

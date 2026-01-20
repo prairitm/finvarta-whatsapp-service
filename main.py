@@ -77,6 +77,14 @@ class NotificationPayload(BaseModel):
     number: str
 
 
+def build_notification_message(payload: NotificationPayload) -> str:
+    """Build WhatsApp text from company_name, pdf_url, and summary."""
+    company = (payload.company_name or "").strip() or "—"
+    pdf = (payload.pdf_url or "").strip() or "—"
+    summary = (payload.summary or "").strip()
+    return f"*Company:* {company}\n*PDF:* {pdf}\n\n*Summary:*\n{summary}"
+
+
 class ConsumeResultItem(BaseModel):
     """Per-message result for consume-notifications."""
     number: str
@@ -92,6 +100,7 @@ class ConsumeNotificationsResponse(BaseModel):
     failed: int
     skipped: int
     results: list[ConsumeResultItem]
+    info: Optional[str] = None  # Set when no records were received from Kafka
 
 
 @app.get("/health")
@@ -355,7 +364,7 @@ async def consume_notifications(
     Consume messages from Kafka topic notification-payload and send summary as WhatsApp text to number.
 
     - **max_messages**: Cap how many messages to process per call; None = no cap.
-    - **poll_timeout_ms**: Timeout for getmany (ms). Only new messages (auto_offset_reset=latest).
+    - **poll_timeout_ms**: Timeout for getmany (ms). When the consumer group has no offset, auto_offset_reset (default earliest) is used; set KAFKA_AUTO_OFFSET_RESET=latest to only read new messages.
     """
     bootstrap = settings.kafka_bootstrap_servers
     servers = [s.strip() for s in bootstrap.split(",")] if isinstance(bootstrap, str) else bootstrap
@@ -363,7 +372,7 @@ async def consume_notifications(
         settings.kafka_topic_notification_payload,
         bootstrap_servers=servers,
         group_id=settings.kafka_consumer_group,
-        auto_offset_reset="latest",
+        auto_offset_reset=settings.kafka_auto_offset_reset,
         enable_auto_commit=False,
     )
     try:
@@ -425,9 +434,12 @@ async def consume_notifications(
                     last_committable[tp] = next_off
                 continue
 
-            if not (payload.summary or "").strip():
-                logger.warning("consume-notifications: empty summary at %s offset %s number=%s", tp, record.offset, payload.number)
-                results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="skipped", error="empty summary"))
+            has_company = bool((payload.company_name or "").strip())
+            has_pdf = bool((payload.pdf_url or "").strip())
+            has_summary = bool((payload.summary or "").strip())
+            if not (has_company or has_pdf or has_summary):
+                logger.warning("consume-notifications: empty content at %s offset %s number=%s", tp, record.offset, payload.number)
+                results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="skipped", error="empty content (company_name, pdf_url, and summary all empty)"))
                 skipped += 1
                 next_off = record.offset + 1
                 if tp not in last_committable or record.offset == last_committable[tp]:
@@ -445,7 +457,7 @@ async def consume_notifications(
                 continue
 
             try:
-                await waha_client.send_text_message(chat_id=chat_id, text=payload.summary, session=None)
+                await waha_client.send_text_message(chat_id=chat_id, text=build_notification_message(payload), session=None)
             except Exception as e:
                 logger.warning("consume-notifications: WAHA send failed at %s offset %s number=%s: %s", tp, record.offset, payload.number, e)
                 results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="error", error=str(e)))
@@ -467,7 +479,11 @@ async def consume_notifications(
     finally:
         await consumer.stop()
 
-    return ConsumeNotificationsResponse(status="success", processed=processed, failed=failed, skipped=skipped, results=results)
+    info = None
+    if processed == 0 and failed == 0 and skipped == 0:
+        info = "No messages received from Kafka (topic may be empty or already consumed by this consumer group). Produce to notification-payload and retry."
+
+    return ConsumeNotificationsResponse(status="success", processed=processed, failed=failed, skipped=skipped, results=results, info=info)
 
 
 if __name__ == "__main__":
