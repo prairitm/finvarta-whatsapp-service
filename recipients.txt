@@ -1,0 +1,4 @@
+# One mobile number per line. Use full number with country code (e.g. 919920906247 or +91 9920906247).
+# Lines starting with # and empty lines are ignored.
+919920906247
+919818709991
