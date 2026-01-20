@@ -85,7 +85,7 @@ def build_notification_message(payload: NotificationPayload) -> str:
     summary = (payload.summary or "").strip()
     # Remove leading "Summary:" or "summary:" from content to avoid duplicating the label
     summary = re.sub(r"^\s*summary\s*:\s*", "", summary, flags=re.IGNORECASE).strip()
-    return f"*Company:* {company}\n*PDF:* {pdf}\n\n*Summary:*\n{summary}"
+    return f"*Company:* {company}\n*PDF:* {pdf}\n\n{summary}"
 
 
 class ConsumeResultItem(BaseModel):
