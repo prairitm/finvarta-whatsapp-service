@@ -1,9 +1,10 @@
 """Configuration management for WAHA FastAPI service."""
 import os
 from pathlib import Path
+from typing import Any, Literal, Optional
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
-from typing import Optional, Literal
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -35,6 +36,26 @@ class Settings(BaseSettings):
     waha_auth_file: str = "waha-auth.env"  # File to load waha_api_key and waha_auth_type from
     waha_debug: bool = False  # Enable debug logging
     recipients_file: str = "recipients.txt"  # Path to recipients file (env: WAHA_RECIPIENTS_FILE)
+
+    # Kafka (configurable via KAFKA_* env vars)
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_topic_notification_payload: str = "notification-payload"
+    kafka_consumer_group: str = "finvarta-whatsapp-notification-consumer"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _kafka_env_override(cls, data: Any) -> Any:
+        """Support KAFKA_* env vars (overrides WAHA_-prefixed or defaults)."""
+        if not isinstance(data, dict):
+            return data
+        for env_key, attr in [
+            ("KAFKA_BOOTSTRAP_SERVERS", "kafka_bootstrap_servers"),
+            ("KAFKA_TOPIC_NOTIFICATION_PAYLOAD", "kafka_topic_notification_payload"),
+            ("KAFKA_CONSUMER_GROUP", "kafka_consumer_group"),
+        ]:
+            if env_key in os.environ:
+                data[attr] = os.environ[env_key]
+        return data
 
     @model_validator(mode="after")
     def _load_auth_from_file(self) -> "Settings":

@@ -6,6 +6,12 @@ from typing import List
 from config import settings
 
 
+def number_to_chat_id(number: str) -> str | None:
+    """Convert a phone number string to WhatsApp chat_id (e.g. +919920906247 -> 919920906247@c.us)."""
+    digits = re.sub(r"\D", "", number)
+    return f"{digits}@c.us" if len(digits) >= 10 else None
+
+
 def load_recipients(filepath: Path) -> List[str]:
     """
     Load and parse chat IDs from the recipients file.

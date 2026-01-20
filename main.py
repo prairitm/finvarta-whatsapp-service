@@ -1,11 +1,19 @@
 """FastAPI application for sending WhatsApp messages via WAHA."""
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import Optional
+import json
+import logging
+from typing import Any, Optional
+
 import httpx
-from waha_client import WAHAClient
+from aiokafka import AIOKafkaConsumer
+from aiokafka.structs import TopicPartition
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, ValidationError
+
 from config import settings
-from recipients import load_recipients, get_recipients_file_path
+from recipients import get_recipients_file_path, load_recipients, number_to_chat_id
+from waha_client import WAHAClient
+
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
@@ -59,6 +67,31 @@ class BulkSendResponse(BaseModel):
     sent: int
     failed: int
     results: list[BulkSendResultItem]
+
+
+class NotificationPayload(BaseModel):
+    """Kafka message from notification-payload topic."""
+    company_name: Optional[str] = None
+    pdf_url: Optional[str] = None
+    summary: str
+    number: str
+
+
+class ConsumeResultItem(BaseModel):
+    """Per-message result for consume-notifications."""
+    number: str
+    company_name: Optional[str] = None
+    status: str  # "success" | "error" | "skipped"
+    error: Optional[str] = None
+
+
+class ConsumeNotificationsResponse(BaseModel):
+    """Response model for consume-notifications."""
+    status: str = "success"
+    processed: int
+    failed: int
+    skipped: int
+    results: list[ConsumeResultItem]
 
 
 @app.get("/health")
@@ -307,6 +340,134 @@ async def send_bulk(request: SendBulkRequest):
             results.append(BulkSendResultItem(chat_id=chat_id, status="error", error=str(e)))
             failed += 1
     return BulkSendResponse(status="success", sent=sent, failed=failed, results=results)
+
+
+@app.post(
+    "/consume-notifications",
+    response_model=ConsumeNotificationsResponse,
+    responses={503: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def consume_notifications(
+    max_messages: Optional[int] = None,
+    poll_timeout_ms: int = 5000,
+):
+    """
+    Consume messages from Kafka topic notification-payload and send summary as WhatsApp text to number.
+
+    - **max_messages**: Cap how many messages to process per call; None = no cap.
+    - **poll_timeout_ms**: Timeout for getmany (ms). Only new messages (auto_offset_reset=latest).
+    """
+    bootstrap = settings.kafka_bootstrap_servers
+    servers = [s.strip() for s in bootstrap.split(",")] if isinstance(bootstrap, str) else bootstrap
+    consumer = AIOKafkaConsumer(
+        settings.kafka_topic_notification_payload,
+        bootstrap_servers=servers,
+        group_id=settings.kafka_consumer_group,
+        auto_offset_reset="latest",
+        enable_auto_commit=False,
+    )
+    try:
+        await consumer.start()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not connect to Kafka at {bootstrap}: {e}",
+        )
+
+    results: list[ConsumeResultItem] = []
+    processed = 0
+    failed = 0
+    skipped = 0
+    # For each tp, the next offset to read (we commit through last_committable - 1). Only advance on success/skip when contiguous.
+    last_committable: dict[TopicPartition, int] = {}
+
+    try:
+        batch = await consumer.getmany(timeout_ms=poll_timeout_ms)
+        recs: list[tuple[TopicPartition, Any]] = []
+        for tp, lst in batch.items():
+            for r in lst:
+                recs.append((tp, r))
+        recs.sort(key=lambda x: (x[0].topic, x[0].partition, x[1].offset))
+
+        for tp, record in recs:
+            if max_messages is not None and (processed + failed + skipped) >= max_messages:
+                break
+
+            raw = record.value
+            if raw is None:
+                logger.warning("consume-notifications: null value at %s offset %s", tp, record.offset)
+                results.append(ConsumeResultItem(number="", company_name=None, status="skipped", error="null message value"))
+                skipped += 1
+                next_off = record.offset + 1
+                if tp not in last_committable or record.offset == last_committable[tp]:
+                    last_committable[tp] = next_off
+                continue
+
+            try:
+                d = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            except Exception as e:
+                logger.warning("consume-notifications: JSON parse error at %s offset %s: %s", tp, record.offset, e)
+                results.append(ConsumeResultItem(number="", company_name=None, status="skipped", error=f"JSON parse error: {e}"))
+                skipped += 1
+                next_off = record.offset + 1
+                if tp not in last_committable or record.offset == last_committable[tp]:
+                    last_committable[tp] = next_off
+                continue
+
+            try:
+                payload = NotificationPayload.model_validate(d)
+            except ValidationError as e:
+                logger.warning("consume-notifications: validation error at %s offset %s: %s", tp, record.offset, e)
+                results.append(ConsumeResultItem(number=d.get("number") or "", company_name=d.get("company_name"), status="skipped", error=str(e)))
+                skipped += 1
+                next_off = record.offset + 1
+                if tp not in last_committable or record.offset == last_committable[tp]:
+                    last_committable[tp] = next_off
+                continue
+
+            if not (payload.summary or "").strip():
+                logger.warning("consume-notifications: empty summary at %s offset %s number=%s", tp, record.offset, payload.number)
+                results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="skipped", error="empty summary"))
+                skipped += 1
+                next_off = record.offset + 1
+                if tp not in last_committable or record.offset == last_committable[tp]:
+                    last_committable[tp] = next_off
+                continue
+
+            chat_id = number_to_chat_id(payload.number)
+            if chat_id is None:
+                logger.warning("consume-notifications: invalid number at %s offset %s number=%s", tp, record.offset, payload.number)
+                results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="skipped", error="invalid number"))
+                skipped += 1
+                next_off = record.offset + 1
+                if tp not in last_committable or record.offset == last_committable[tp]:
+                    last_committable[tp] = next_off
+                continue
+
+            try:
+                await waha_client.send_text_message(chat_id=chat_id, text=payload.summary, session=None)
+            except Exception as e:
+                logger.warning("consume-notifications: WAHA send failed at %s offset %s number=%s: %s", tp, record.offset, payload.number, e)
+                results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="error", error=str(e)))
+                failed += 1
+                continue
+
+            results.append(ConsumeResultItem(number=payload.number, company_name=payload.company_name, status="success", error=None))
+            processed += 1
+            next_off = record.offset + 1
+            if tp not in last_committable or record.offset == last_committable[tp]:
+                last_committable[tp] = next_off
+
+        if last_committable:
+            await consumer.commit(offsets=last_committable)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    finally:
+        await consumer.stop()
+
+    return ConsumeNotificationsResponse(status="success", processed=processed, failed=failed, skipped=skipped, results=results)
 
 
 if __name__ == "__main__":
