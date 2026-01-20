@@ -1,6 +1,7 @@
 """FastAPI application for sending WhatsApp messages via WAHA."""
 import json
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
@@ -82,6 +83,8 @@ def build_notification_message(payload: NotificationPayload) -> str:
     company = (payload.company_name or "").strip() or "—"
     pdf = (payload.pdf_url or "").strip() or "—"
     summary = (payload.summary or "").strip()
+    # Remove leading "Summary:" or "summary:" from content to avoid duplicating the label
+    summary = re.sub(r"^\s*summary\s*:\s*", "", summary, flags=re.IGNORECASE).strip()
     return f"*Company:* {company}\n*PDF:* {pdf}\n\n*Summary:*\n{summary}"
 
 
